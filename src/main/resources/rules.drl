@@ -1,0 +1,154 @@
+package net.tarilabs.mpes.demo2015;
+
+import com.rapplogic.xbee.api.XBeeAddress64;
+import com.rapplogic.xbee.api.zigbee.ZNetRxIoSampleResponse;
+import net.tarilabs.mpes.demo2015.MyMain;
+
+global org.slf4j.Logger LOG;
+
+import function net.tarilabs.camelxbeeapi.XBeeAPIUtils.addressAsMacFormat;
+
+function onCamel(String route, Object message) {
+	MyMain.getInstance().getCamelTemplate().sendBody(route, message);
+}
+
+declare ZNetRxIoSampleResponse
+	@role(event)
+	@expires(60m)
+end
+
+declare DockedEvt
+	@role(event)
+	@timestamp(ts)
+	ts : long
+end
+
+declare UnDockedEvt
+	@role(event)
+	@timestamp(ts)
+	ts : long
+end
+
+/** 
+ * Filter01
+ * Remove everything which is not from the XBee 00:13:A2:00:40:68:E0:95
+ *
+ */
+rule "Filter01"
+no-loop
+salience 1000
+when
+    $e : ZNetRxIoSampleResponse( addressAsMacFormat(remoteAddress64) != "00:13:A2:00:40:68:E0:95" )
+then
+   	retract($e);
+end
+
+/**
+ * Filter02
+ * Remove non-analog reading packets from XBee 00:13:A2:00:40:68:E0:95
+ *
+ */
+rule "Filter02"
+no-loop 
+salience 1000
+when
+    $e : ZNetRxIoSampleResponse(
+			addressAsMacFormat(remoteAddress64) == "00:13:A2:00:40:68:E0:95" , 
+			containsAnalog == false
+		 )
+then
+   	retract($e);
+end
+
+/*
+ * Detect Docked
+ * The analog sensor reading for docked is about 1023.
+ * The rule shall detect the Home Toothbrush as docked when the average is above threshold including at least 3 analog sensor reading.
+ */
+rule "Detect Docked"
+no-loop 
+when
+    accumulate ( ZNetRxIoSampleResponse( containsAnalog == true, $analog1 : analog1 ) over window:length( 3 );
+    			 $avg : average( $analog1 ),
+    			 $count : count( $analog1 );  
+    			 $avg > 950 , $count == 3
+    )
+    not ( DockedEvt() )
+then
+	DockedEvt de = new DockedEvt();
+	de.setTs(drools.getWorkingMemory().getSessionClock().getCurrentTime());
+    insert(de);
+end
+
+/*
+ * Detect UnDocked
+ * The analog sensor reading for undocked is about 264.
+ * The rule shall detect the Home Toothbrush as UNdocked when the average is less than threshold including at least 3 analog sensor reading.
+ */
+rule "Detect UnDocked"
+no-loop 
+when
+    accumulate ( ZNetRxIoSampleResponse( containsAnalog == true, $analog1 : analog1 ) over window:length( 3 );
+    			 $avg : average( $analog1 ),  
+    			 $count : count( $analog1 );
+    			 $avg < 400 , $count == 3
+    )
+    not ( UnDockedEvt() ) 
+then
+	UnDockedEvt ude = new UnDockedEvt();
+	ude.setTs(drools.getWorkingMemory().getSessionClock().getCurrentTime());
+    insert(ude);
+end
+
+/**
+ * Toothbrush Session
+ * Detect a session of use for the Home Toothbrush when a DOCKED follows an UNDOCKED.
+ */
+rule "Home Toothbrush Session"
+no-loop
+when
+	$ude : UnDockedEvt()
+	$de : DockedEvt( this after $ude )
+then
+	long millis = $de.getTs() - $ude.getTs() - 1000; // assume a few sec of non-brushing activity
+	long mins = millis/1000/60;
+	long secs = (millis/1000) % 60;
+	long oscillations = (long) ( (7600.0/60/1000) * millis );
+	String sentence = "I just used my toothbrush! Total time: "
+			+( (mins>0)?mins+"m":"" )
+			+secs+"s "
+			+"Oscillations: "+oscillations;
+	LOG.debug("{}", sentence);
+	onCamel("direct:sentence", sentence);
+	retract($de);
+	retract($ude);
+end
+
+/**
+ * Housekeep
+ * We're interested only on the falling edge of UNDOCKED -> DOCKED, hence any DOCKED event happened before UNDOCKED event can be discarded already
+ */
+rule "Housekeep only falling egde"
+no-loop
+when
+	$ude : UnDockedEvt()
+	$de : DockedEvt( this before $ude )
+then
+	retract($de);
+end
+
+rule "Sample in Drools"
+no-loop 
+when
+    $e : ZNetRxIoSampleResponse( containsAnalog == true, $analog1 : analog1 )
+then
+   	LOG.debug("{}", $analog1);
+end
+
+
+rule "Ciao"
+no-loop 
+when
+then
+    if (LOG.isDebugEnabled()) LOG.debug("Ciao");
+end
